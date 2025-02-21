@@ -1,0 +1,131 @@
+name: Sync from DockerHub to GHCR
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fetch-image-tags:
+    name: Fetch image tags from DockerHub
+    runs-on: ubuntu-24.04
+    outputs:
+      tags: ${{ steps.fetch-tags.outputs.tags }}
+    steps:
+      - name: Fetch Docker Hub tags
+        id: fetch-tags
+        run: |
+          PAGE=1
+          ALL_TAGS=""
+
+          while true; do
+            echo "Fetching page $PAGE..."
+            RESPONSE=$(curl -s "https://hub.docker.com/v2/repositories/dockware/dev/tags/?page=$PAGE&page_size=100")
+            TAGS=$(echo "$RESPONSE" | jq -r '.results[] | select(.name | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$")) | .name')
+            ALL_TAGS="$ALL_TAGS $TAGS"
+
+            NEXT_PAGE=$(echo "$RESPONSE" | jq -r '.next')
+            if [ "$NEXT_PAGE" == "null" ]; then
+              break
+            fi
+
+            PAGE=$((PAGE + 1))
+          done
+
+          ALL_TAGS=$(echo "$ALL_TAGS" | xargs -n1 | tac | xargs)
+
+          echo "All tags: $ALL_TAGS"
+          echo "tags=$ALL_TAGS" >> $GITHUB_OUTPUT
+
+  sync-images:
+    name: Sync tagged images to GHCR
+    runs-on: ubuntu-24.04
+    needs: fetch-image-tags
+    steps:
+      - name: Set up Docker
+        uses: docker/setup-docker-action@370a7dad4b8ce8dbf00f9363e1652e5074dd6abe # v4.1.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - name: Install and setup Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version: 1.24
+      - name: Install crane
+        uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to DockerHub
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Sync tagged images
+        run: |
+          for TAG in ${{ needs.fetch-image-tags.outputs.tags }}; do
+            IMAGE="dockware/dev:$TAG"
+            GHCR_IMAGE="ghcr.io/${{ github.repository }}:$TAG"
+          
+            DOCKERHUB_MANIFEST=$(curl -s "https://hub.docker.com/v2/repositories/dockware/dev/tags/$TAG")
+            DOCKERHUB_DIGEST=$(curl -s "https://hub.docker.com/v2/repositories/dockware/dev/tags/$TAG" | jq -r '.digest')
+          
+            if [ -z "$DOCKERHUB_DIGEST" ] || [ "$DOCKERHUB_DIGEST" == "null" ]; then
+              echo "Image $IMAGE has no digest. Skipping synchronization."
+              continue
+            fi
+          
+            GHCR_DIGEST=""
+            GHCR_RESPONSE=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+              "https://ghcr.io/v2/${{ github.repository }}/manifests/$TAG")
+               
+            if echo "$GHCR_RESPONSE" | jq -e '.errors == null' > /dev/null 2>&1; then
+              GHCR_DIGEST=$(echo "$GHCR_RESPONSE" | jq -r '.config.labels["com.dockerhub.original-digest"] // empty')
+            fi
+          
+            if [ "$DOCKERHUB_DIGEST" == "$GHCR_DIGEST" ]; then
+              echo "Image $GHCR_IMAGE is already up-to-date. Skipping syncronization."
+              continue
+            fi
+          
+            ARCHITECTURES=$(echo "$DOCKERHUB_MANIFEST" | jq -r '.images[] | .architecture')
+            for ARCH in $ARCHITECTURES; do
+              ARCH_IMAGE="dockware/dev:$TAG-$ARCH"
+              GHCR_ARCH_IMAGE="ghcr.io/${{ github.repository }}:$TAG-$ARCH"
+              
+              ARCH_DOCKERHUB_DIGEST=$(echo "$DOCKERHUB_MANIFEST" | jq -r ".images[] | select(.architecture == \"$ARCH\") | .digest")
+          
+              if [ -z "$ARCH_DOCKERHUB_DIGEST" ] || [ "$ARCH_DOCKERHUB_DIGEST" == "null" ]; then
+                echo "Image $ARCH_IMAGE has no digest. Skipping synchronization."
+                continue
+              fi
+          
+              GHCR_ARCH_DIGEST=""
+              GHCR_ARCH_RESPONSE=$(curl -s \
+                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+                "https://ghcr.io/v2/${{ github.repository }}/manifests/$TAG-$ARCH")
+
+              if echo "$GHCR_ARCH_RESPONSE" | jq -e '.errors == null' > /dev/null 2>&1; then
+                GHCR_ARCH_DIGEST=$(echo "$GHCR_ARCH_RESPONSE" | jq -r '.config.labels["com.dockerhub.original-digest"] // empty')
+              fi
+          
+              if [ "$ARCH_DOCKERHUB_DIGEST" == "$GHCR_ARCH_DIGEST" ]; then
+                echo "Image $GHCR_ARCH_IMAGE is already up-to-date. Skipping synchronization."
+                continue
+              fi
+          
+              docker pull --platform linux/$ARCH $IMAGE
+              docker tag $IMAGE $GHCR_ARCH_IMAGE
+              docker push $GHCR_ARCH_IMAGE
+              docker rmi $IMAGE $GHCR_ARCH_IMAGE
+          
+              crane mutate $GHCR_ARCH_IMAGE --label com.dockerhub.original-digest="$ARCH_DOCKERHUB_DIGEST"
+            done
+          
+            docker buildx imagetools create --tag $GHCR_IMAGE $(echo "$ARCHITECTURES" | xargs -I{} echo "ghcr.io/${{ github.repository }}:$TAG-{}")
+          
+            crane mutate $GHCR_IMAGE --label com.dockerhub.original-digest="$DOCKERHUB_DIGEST"
+          done
